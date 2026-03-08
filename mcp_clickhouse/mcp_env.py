@@ -292,9 +292,25 @@ class MCPServerConfig:
         CLICKHOUSE_MCP_BIND_PORT: Bind port for HTTP/SSE (default: 8000)
         CLICKHOUSE_MCP_QUERY_TIMEOUT: SELECT tool timeout in seconds (default: 30)
         CLICKHOUSE_MCP_AUTH_TOKEN: Authentication token for HTTP/SSE transports (required
-            unless CLICKHOUSE_MCP_AUTH_DISABLED=true)
+            unless CLICKHOUSE_MCP_AUTH_DISABLED=true or CLICKHOUSE_MCP_OAUTH_PROXY_ENABLED=true)
         CLICKHOUSE_MCP_AUTH_DISABLED: Disable authentication (default: false, use
             only for development)
+        CLICKHOUSE_MCP_OAUTH_PROXY_ENABLED: Enable OAuth proxy mode where nginx ingress
+            handles OAuth2/Keycloak authentication and forwards group membership via
+            X-Auth-Request-Groups header (default: false)
+        CLICKHOUSE_MCP_ALLOWED_GROUPS: Comma-separated list of Keycloak groups whose
+            members are allowed access (e.g. "Dastan-Team"). Used in both OAuth proxy
+            mode and OIDC mode for group-based access control.
+        CLICKHOUSE_MCP_OIDC_ENABLED: Enable OIDC mode — FastMCP acts as an OAuth2 proxy
+            to Keycloak, serves /.well-known/oauth-authorization-server, and validates
+            Keycloak JWTs. This is required for MCP clients like Claude Code that
+            follow the MCP OAuth2 spec (default: false).
+        CLICKHOUSE_MCP_OIDC_DISCOVERY_URL: Keycloak OIDC discovery URL, e.g.
+            https://sso.example.com/realms/myrealm/.well-known/openid-configuration
+        CLICKHOUSE_MCP_OIDC_CLIENT_ID: Keycloak client ID for the MCP server
+        CLICKHOUSE_MCP_OIDC_CLIENT_SECRET: Keycloak client secret for the MCP server
+        CLICKHOUSE_MCP_BASE_URL: Public base URL of this MCP server, e.g.
+            https://clickhouse-mcp.yektanet.tech (required for OIDC mode)
     """
 
     @property
@@ -326,6 +342,48 @@ class MCPServerConfig:
     def auth_disabled(self) -> bool:
         """Get whether authentication is disabled."""
         return os.getenv("CLICKHOUSE_MCP_AUTH_DISABLED", "false").lower() == "true"
+
+    @property
+    def oauth_proxy_enabled(self) -> bool:
+        """Enable OAuth proxy mode.
+
+        When true, the nginx ingress oauth2-proxy handles Keycloak authentication
+        and forwards X-Auth-Request-Groups / X-Auth-Request-Email headers.
+        Bearer token auth is disabled; group membership is validated by
+        OAuthProxyGroupMiddleware instead.
+        """
+        return os.getenv("CLICKHOUSE_MCP_OAUTH_PROXY_ENABLED", "false").lower() == "true"
+
+    @property
+    def allowed_groups(self) -> list[str]:
+        """Keycloak groups allowed to access the server (used in both auth modes)."""
+        raw = os.getenv("CLICKHOUSE_MCP_ALLOWED_GROUPS", "")
+        return [g.strip() for g in raw.split(",") if g.strip()]
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """Enable OIDC mode — FastMCP proxies OAuth2 to Keycloak and serves well-known endpoints."""
+        return os.getenv("CLICKHOUSE_MCP_OIDC_ENABLED", "false").lower() == "true"
+
+    @property
+    def oidc_discovery_url(self) -> Optional[str]:
+        """Keycloak OIDC discovery URL (openid-configuration endpoint)."""
+        return os.getenv("CLICKHOUSE_MCP_OIDC_DISCOVERY_URL")
+
+    @property
+    def oidc_client_id(self) -> Optional[str]:
+        """Keycloak client ID registered for this MCP server."""
+        return os.getenv("CLICKHOUSE_MCP_OIDC_CLIENT_ID")
+
+    @property
+    def oidc_client_secret(self) -> Optional[str]:
+        """Keycloak client secret for this MCP server."""
+        return os.getenv("CLICKHOUSE_MCP_OIDC_CLIENT_SECRET")
+
+    @property
+    def base_url(self) -> Optional[str]:
+        """Public base URL of this MCP server (required for OIDC mode)."""
+        return os.getenv("CLICKHOUSE_MCP_BASE_URL")
 
 
 _MCP_CONFIG_INSTANCE = None

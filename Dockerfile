@@ -24,21 +24,29 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Then, add the rest of the project source code and install it
 # Installing separately from its dependencies allows optimal layer caching
+# Remove `--no-extra chdb` to install chdb library.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable
+    uv sync --locked --no-dev --no-editable --no-extra chdb
 
 # Production stage - Use minimal Python image
 FROM python:3.13-slim-bookworm
 
+# Create a non-root user with a home directory
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --create-home appuser
+
 # Set the working directory
 WORKDIR /app
 
-# Copy the virtual environment from the builder stage
-COPY --from=builder /app/.venv /app/.venv
+# Copy the virtual environment from the builder stage with correct ownership
+COPY --from=builder --chown=1001:1001 /app/.venv /app/.venv
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
+
+# Switch to non-root user
+USER 1001
 
 # Run the MCP ClickHouse server by default
 CMD ["python", "-m", "mcp_clickhouse.main"]

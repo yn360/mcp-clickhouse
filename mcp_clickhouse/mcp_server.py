@@ -8,7 +8,6 @@ import re
 import uuid
 
 import clickhouse_connect
-import chdb.session as chs
 from clickhouse_connect.driver.binding import format_query_value
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -17,12 +16,19 @@ from fastmcp.tools import Tool
 from fastmcp.prompts import Prompt
 from fastmcp.exceptions import ToolError
 from dataclasses import dataclass, field, asdict, is_dataclass
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, Response
 
 from mcp_clickhouse.mcp_env import get_config, get_chdb_config, get_mcp_config, TransportType
 from mcp_clickhouse.chdb_prompt import CHDB_PROMPT
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier, JWTVerifier
+from fastmcp.server.auth.oidc_proxy import OIDCProxy, OIDCConfiguration
+from fastmcp.server.auth.auth import RemoteAuthProvider, AccessToken
+
+# chdb is an optional dependency (~600 MB embedded ClickHouse binary).
+# It is imported lazily below when CHDB_ENABLED=true.
+chs = None
 
 
 @dataclass
@@ -76,7 +82,80 @@ mcp_config = get_mcp_config()
 http_transports = [TransportType.HTTP.value, TransportType.SSE.value]
 
 if mcp_config.server_transport in http_transports:
-    if mcp_config.auth_disabled:
+    if mcp_config.oidc_enabled:
+        # OIDC mode: FastMCP acts as an OAuth2 proxy to Keycloak.
+        # Serves /.well-known/oauth-authorization-server so MCP clients (e.g. Claude Code)
+        # can discover the auth server and complete the OAuth2 PKCE flow.
+        # Group membership is validated at token-exchange time via GroupAwareJWTVerifier.
+        if not all([mcp_config.oidc_discovery_url, mcp_config.oidc_client_id,
+                    mcp_config.oidc_client_secret, mcp_config.base_url]):
+            raise ValueError(
+                "OIDC mode requires CLICKHOUSE_MCP_OIDC_DISCOVERY_URL, "
+                "CLICKHOUSE_MCP_OIDC_CLIENT_ID, CLICKHOUSE_MCP_OIDC_CLIENT_SECRET, "
+                "and CLICKHOUSE_MCP_BASE_URL to be set."
+            )
+
+        class GroupAwareJWTVerifier(JWTVerifier):
+            """JWTVerifier that additionally validates Keycloak group membership.
+
+            Keycloak includes group membership in the 'groups' claim as a list of
+            strings, optionally prefixed with '/'. A token is rejected if the user
+            is not a member of at least one of the configured allowed groups.
+            """
+
+            def __init__(self, *args, allowed_groups: list[str], **kwargs):
+                super().__init__(*args, **kwargs)
+                self._allowed_groups = frozenset(allowed_groups)
+
+            async def load_access_token(self, token: str) -> AccessToken | None:
+                access_token = await super().load_access_token(token)
+                if access_token is None:
+                    return None
+                if not self._allowed_groups:
+                    return access_token  # No group restriction configured
+                # Keycloak 'groups' claim: ["GroupName"] or ["/GroupName"]
+                raw_groups = access_token.claims.get("groups", [])
+                user_groups = {g.lstrip("/") for g in raw_groups}
+                if not user_groups & self._allowed_groups:
+                    logger.warning(
+                        "OIDC token rejected: user groups %s not in allowed groups %s",
+                        user_groups,
+                        self._allowed_groups,
+                    )
+                    return None
+                return access_token
+
+        oidc_config = OIDCConfiguration.get_oidc_configuration(
+            mcp_config.oidc_discovery_url,  # type: ignore[arg-type]
+            strict=None,
+            timeout_seconds=30,
+        )
+        token_verifier = GroupAwareJWTVerifier(
+            jwks_uri=str(oidc_config.jwks_uri),
+            issuer=str(oidc_config.issuer),
+            allowed_groups=mcp_config.allowed_groups,
+        )
+        auth_provider = OIDCProxy(
+            config_url=mcp_config.oidc_discovery_url,  # type: ignore[arg-type]
+            client_id=mcp_config.oidc_client_id,  # type: ignore[arg-type]
+            client_secret=mcp_config.oidc_client_secret,  # type: ignore[arg-type]
+            base_url=mcp_config.base_url,  # type: ignore[arg-type]
+            token_verifier=token_verifier,
+        )
+        logger.info(
+            "OIDC authentication enabled. Discovery URL: %s, Allowed groups: %s",
+            mcp_config.oidc_discovery_url,
+            mcp_config.allowed_groups,
+        )
+    elif mcp_config.oauth_proxy_enabled:
+        logger.info(
+            "OAuth proxy authentication enabled. Auth delegated to nginx ingress. "
+            "Allowed groups: %s",
+            mcp_config.allowed_groups,
+        )
+        # No StaticTokenVerifier — nginx ingress oauth2-proxy handles Keycloak auth.
+        # Group membership is enforced by OAuthProxyGroupMiddleware below.
+    elif mcp_config.auth_disabled:
         logger.warning("WARNING: MCP SERVER AUTHENTICATION IS DISABLED")
         logger.warning("Only use this for local development/testing.")
         logger.warning("DO NOT expose to networks.")
@@ -95,6 +174,53 @@ if mcp_config.server_transport in http_transports:
         )
 
 mcp = FastMCP(name=MCP_SERVER_NAME, auth=auth_provider)
+
+
+def _make_oauth_proxy_middleware(allowed_groups: list[str]):
+    """Return a middleware class with allowed_groups captured in a closure.
+
+    FastMCP.add_middleware() does not forward kwargs to the middleware constructor,
+    so we bake the groups into the class at creation time.
+    """
+    _groups = frozenset(allowed_groups)
+
+    class OAuthProxyGroupMiddleware(BaseHTTPMiddleware):
+        """Validates Keycloak group membership forwarded by the nginx ingress oauth2-proxy.
+
+        The oauth2-proxy sets X-Auth-Request-Groups to a comma-separated list of
+        Keycloak groups the authenticated user belongs to. Requests are rejected with
+        401/403 unless the user is a member of at least one configured allowed group.
+        The /health path is exempted so Kubernetes liveness/readiness probes always pass.
+        """
+
+        async def dispatch(self, request: Request, call_next):
+            # Exempt health endpoint so Kubernetes probes are never blocked
+            if request.url.path == "/health":
+                return await call_next(request)
+
+            groups_header = request.headers.get("X-Auth-Request-Groups", "")
+            if not groups_header:
+                return Response("Unauthorized: missing X-Auth-Request-Groups header", status_code=401)
+
+            user_groups = {g.strip() for g in groups_header.split(",") if g.strip()}
+            if not user_groups & _groups:
+                return Response(
+                    f"Forbidden: not in allowed groups {sorted(_groups)}",
+                    status_code=403,
+                )
+            return await call_next(request)
+
+    return OAuthProxyGroupMiddleware
+
+
+if mcp_config.oauth_proxy_enabled:
+    if mcp_config.allowed_groups:
+        mcp.add_middleware(_make_oauth_proxy_middleware(mcp_config.allowed_groups))
+    else:
+        logger.warning(
+            "OAuth proxy mode enabled but CLICKHOUSE_MCP_ALLOWED_GROUPS is not set. "
+            "All authenticated users will have access."
+        )
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -671,6 +797,10 @@ def _init_chdb_client():
             logger.info("chDB is disabled, skipping client initialization")
             return None
 
+        if chs is None:
+            logger.error("Cannot initialize chDB client: chdb package is not installed")
+            return None
+
         client_config = get_chdb_config().get_client_config()
         data_path = client_config["data_path"]
         logger.info(f"Creating chDB client with data_path={data_path}")
@@ -698,6 +828,14 @@ if os.getenv("CLICKHOUSE_ENABLED", "true").lower() == "true":
 
 
 if os.getenv("CHDB_ENABLED", "false").lower() == "true":
+    try:
+        import chdb.session as chs
+    except ImportError:
+        chs = None
+        logger.error(
+            "CHDB_ENABLED=true but the 'chdb' package is not installed. "
+            "Install it with: pip install 'mcp-clickhouse[chdb]'"
+        )
     _chdb_client = _init_chdb_client()
     if _chdb_client:
         atexit.register(lambda: _chdb_client.close())
