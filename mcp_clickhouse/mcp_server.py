@@ -141,6 +141,12 @@ if mcp_config.server_transport in http_transports:
             client_secret=mcp_config.oidc_client_secret,  # type: ignore[arg-type]
             base_url=mcp_config.base_url,  # type: ignore[arg-type]
             token_verifier=token_verifier,
+            # Disable CIMD (Client-Initiated Metadata Discovery) — the server cannot
+            # reach https://claude.ai to fetch Claude Code's client metadata.
+            # Instead, pre-approve localhost redirect URIs so Claude Code can complete
+            # the PKCE flow without dynamic registration.
+            enable_cimd=False,
+            allowed_client_redirect_uris=["http://localhost:*", "http://127.0.0.1:*"],
         )
         logger.info(
             "OIDC authentication enabled. Discovery URL: %s, Allowed groups: %s",
